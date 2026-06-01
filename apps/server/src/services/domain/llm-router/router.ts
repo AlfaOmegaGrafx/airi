@@ -1,12 +1,13 @@
 import type { Buffer } from 'node:buffer'
 
 import type Redis from 'ioredis'
+import type { Voice } from 'unspeech'
 
 import type { GatewayMetrics } from '../../../otel'
 import type { EnvelopeCrypto } from '../../../utils/envelope-crypto'
 import type { ConfigKVService } from '../../adapters/config-kv'
 import type { TtsAdapterId, TtsInput } from '../../adapters/tts/types'
-import type { LlmRouteRequest, LlmUpstream, TtsUpstream } from './types'
+import type { LlmRouteContext, LlmRouteRequest, LlmUpstream, TtsUpstream } from './types'
 
 import { Buffer as NodeBuffer } from 'node:buffer'
 
@@ -176,6 +177,7 @@ export function createLlmRouterService(options: CreateLlmRouterServiceOptions) {
   const logger = useLogger('llm-router').useGlobalConfig()
   const fetchImpl = options.fetchImpl ?? globalThis.fetch
   const configLoader = createConfigLoader({ configKV: options.configKV, ttlMs: options.configCacheTtlMs })
+  const ttsVoiceCatalogLoads = new Map<string, Promise<Voice[]>>()
 
   /**
    * Run one upstream's key list in order, returning either:
@@ -193,7 +195,7 @@ export function createLlmRouterService(options: CreateLlmRouterServiceOptions) {
     fallbackHttpCodes: number[],
     onAttemptFailure: (failure: { keyId: string, status: number | 'timeout', bodySnippet?: string, errorMessage?: string }) => void,
   ): Promise<
-    | { kind: 'ok', response: Response, attemptIndex: number }
+    | { kind: 'ok', response: Response, attemptIndex: number, upstreamModel: string }
     | { kind: 'exhausted', failures: Array<{ keyId: string, status: number | 'timeout', bodySnippet?: string, errorMessage?: string }> }
   > {
     const provider = deriveProviderTag(upstream.baseURL)
@@ -254,7 +256,7 @@ export function createLlmRouterService(options: CreateLlmRouterServiceOptions) {
             [AIRI_ATTR_GEN_AI_GATEWAY_KEY_ID]: key.id,
             [AIRI_ATTR_GEN_AI_GATEWAY_FALLBACK_DEPTH]: attemptIndex,
           })
-          return { kind: 'ok', response, attemptIndex }
+          return { kind: 'ok', response, attemptIndex, upstreamModel: effectiveModel }
         }
 
         const status = response.status
@@ -323,7 +325,7 @@ export function createLlmRouterService(options: CreateLlmRouterServiceOptions) {
     return { kind: 'exhausted', failures }
   }
 
-  async function route(req: LlmRouteRequest): Promise<Response> {
+  async function route(req: LlmRouteRequest, ctx?: LlmRouteContext): Promise<Response> {
     // Honor pre-flight cancellation before any work.
     if (req.abortSignal?.aborted)
       throw req.abortSignal.reason ?? new Error('aborted')
@@ -346,6 +348,11 @@ export function createLlmRouterService(options: CreateLlmRouterServiceOptions) {
       const upstream = slice.model.upstreams[i]
       const provider = deriveProviderTag(upstream.baseURL)
       triedUpstreams += 1
+      // Surface the current upstream so the caller can label success metrics
+      // by provider. On `ok` this holds the winning provider; on full
+      // exhaustion it holds the last one tried.
+      if (ctx)
+        ctx.provider = provider
 
       const perAttemptTimeoutMs = upstream.timeoutMs ?? defaults.perAttemptTimeoutMs ?? 30000
 
@@ -358,8 +365,11 @@ export function createLlmRouterService(options: CreateLlmRouterServiceOptions) {
         (failure) => { allFailures.push({ provider, ...failure }) },
       )
 
-      if (result.kind === 'ok')
+      if (result.kind === 'ok') {
+        if (ctx)
+          ctx.upstreamModel = result.upstreamModel
         return result.response
+      }
 
       // This upstream exhausted; record and continue.
       options.gatewayMetrics?.keyExhaustedCount.add(1, { provider })
@@ -532,7 +542,7 @@ export function createLlmRouterService(options: CreateLlmRouterServiceOptions) {
     return { kind: 'exhausted', failures }
   }
 
-  async function routeTts(req: { modelName: string, input: TtsInput, abortSignal?: AbortSignal }): Promise<Response> {
+  async function routeTts(req: { modelName: string, input: TtsInput, abortSignal?: AbortSignal }, ctx?: LlmRouteContext): Promise<Response> {
     if (req.abortSignal?.aborted)
       throw req.abortSignal.reason ?? new Error('aborted')
 
@@ -558,6 +568,10 @@ export function createLlmRouterService(options: CreateLlmRouterServiceOptions) {
       const upstream = slice.model.upstreams[i]
       const providerTag = deriveProviderTag(upstream.baseURL)
       triedUpstreams += 1
+      // Surface the current upstream so the caller can label success metrics
+      // by provider (winning provider on `ok`, last-tried on exhaustion).
+      if (ctx)
+        ctx.provider = providerTag
 
       // tts upstream schema has no per-upstream timeoutMs (see ttsUpstreamSchema);
       // we use the defaults bucket alone here.
@@ -652,44 +666,55 @@ export function createLlmRouterService(options: CreateLlmRouterServiceOptions) {
       }
     }
 
-    const unspeechBaseURL = (await options.configKV.getOrThrow('UNSPEECH_UPSTREAM')).restBaseURL
+    const existingLoad = ttsVoiceCatalogLoads.get(cacheKey)
+    if (existingLoad != null)
+      return existingLoad
 
-    // Live providers (Azure) need the decrypted Azure subscription key + region;
-    // static-catalog providers (alibaba, volcengine) ignore both. The router
-    // decrypts unconditionally so the adapter doesn't have to know which
-    // category it's in — adapters that don't need creds just won't read them.
-    const region = typeof upstream.adapterParams?.region === 'string'
-      ? upstream.adapterParams.region
-      : undefined
+    const load = (async () => {
+      const unspeechBaseURL = (await options.configKV.getOrThrow('UNSPEECH_UPSTREAM')).restBaseURL
 
-    const keyEntry = upstream.keys[0]
-    const plaintext = slice.model.provider === 'azure'
-      ? options.envelopeCrypto.decryptKey(keyEntry.ciphertext, { modelName, keyEntryId: keyEntry.id })
-      : undefined
+      // Live providers (Azure) need the decrypted Azure subscription key + region;
+      // static-catalog providers (alibaba, volcengine) ignore both. The router
+      // decrypts unconditionally so the adapter doesn't have to know which
+      // category it's in — adapters that don't need creds just won't read them.
+      const region = typeof upstream.adapterParams?.region === 'string'
+        ? upstream.adapterParams.region
+        : undefined
 
-    try {
-      const voices = await adapter.getVoiceCatalog({
-        keyPlaintext: plaintext,
-        region,
-        adapterParams: upstream.adapterParams ?? {},
-        unspeechBaseURL,
-        fetchImpl,
-      })
+      const keyEntry = upstream.keys[0]
+      const plaintext = slice.model.provider === 'azure'
+        ? options.envelopeCrypto.decryptKey(keyEntry.ciphertext, { modelName, keyEntryId: keyEntry.id })
+        : undefined
 
-      // Cache only on success — failure responses must NOT be persisted or
-      // the next admin reconfigure would have to wait out the TTL even after
-      // fixing credentials.
-      const ttl = options.ttsVoiceCacheTtlSeconds ?? ttsVoicesCacheTtl(slice.model.provider)
-      await options.redis.set(cacheKey, JSON.stringify(voices), 'EX', ttl)
-        .catch((err) => {
-          logger.withError(err).withFields({ cacheKey }).warn('failed to write tts voices cache')
+      try {
+        const voices = await adapter.getVoiceCatalog({
+          keyPlaintext: plaintext,
+          region,
+          adapterParams: upstream.adapterParams ?? {},
+          unspeechBaseURL,
+          fetchImpl,
         })
 
-      return voices
-    }
-    finally {
-      plaintext?.fill(0)
-    }
+        // Cache only on success — failure responses must NOT be persisted or
+        // the next admin reconfigure would have to wait out the TTL even after
+        // fixing credentials.
+        const ttl = options.ttsVoiceCacheTtlSeconds ?? ttsVoicesCacheTtl(slice.model.provider)
+        await options.redis.set(cacheKey, JSON.stringify(voices), 'EX', ttl)
+          .catch((err) => {
+            logger.withError(err).withFields({ cacheKey }).warn('failed to write tts voices cache')
+          })
+
+        return voices
+      }
+      finally {
+        plaintext?.fill(0)
+      }
+    })().finally(() => {
+      ttsVoiceCatalogLoads.delete(cacheKey)
+    })
+
+    ttsVoiceCatalogLoads.set(cacheKey, load)
+    return load
   }
 
   /**

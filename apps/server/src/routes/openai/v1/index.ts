@@ -7,7 +7,8 @@ import type { UsageInfo } from '../../../services/domain/billing/billing'
 import type { BillingService } from '../../../services/domain/billing/billing-service'
 import type { FluxMeter } from '../../../services/domain/billing/flux-meter'
 import type { FluxService } from '../../../services/domain/flux'
-import type { LlmRouterService } from '../../../services/domain/llm-router'
+import type { LlmRouteContext, LlmRouterService } from '../../../services/domain/llm-router'
+import type { ChatGenerationTrace, TtsGenerationTrace } from '../../../services/domain/llm-tracing'
 import type { RequestLogService } from '../../../services/domain/request-log'
 import type { HonoEnv } from '../../../types/hono'
 
@@ -20,6 +21,7 @@ import { configGuard } from '../../../middlewares/config-guard'
 import { rateLimiter } from '../../../middlewares/rate-limit'
 import { captureSafe } from '../../../services/adapters/posthog'
 import { calculateFluxFromUsage, extractUsageFromBody } from '../../../services/domain/billing/billing'
+import { startChatGeneration, startTtsGeneration } from '../../../services/domain/llm-tracing'
 import { createBadGatewayError, createBadRequestError, createPaymentRequiredError, createServiceUnavailableError } from '../../../utils/error'
 import { nanoid } from '../../../utils/id'
 import {
@@ -34,6 +36,11 @@ import {
 } from '../../../utils/observability'
 
 const tracer = trace.getTracer('v1-completions')
+
+interface LlmTracingDeps {
+  startChatGeneration: (input: Parameters<typeof startChatGeneration>[0]) => ChatGenerationTrace
+  startTtsGeneration: (input: Parameters<typeof startTtsGeneration>[0]) => TtsGenerationTrace
+}
 
 const SAFE_RESPONSE_HEADERS = new Set([
   'content-type',
@@ -51,12 +58,18 @@ function buildSafeResponseHeaders(response: Response): Headers {
   return headers
 }
 
-function getLlmMetricAttributes(opts: { model: string, type: string, status: number }): Record<string, string | number> {
+function getLlmMetricAttributes(opts: { model: string, type: string, status: number, provider: string }): Record<string, string | number> {
+  // `provider` is the upstream the router actually used (winning upstream on
+  // success, last-tried on exhaustion), so per-provider rollups in Grafana
+  // line up with each vendor's own console. Same label name as the gateway
+  // error counters (`airi_gen_ai_gateway_upstream_errors{provider}`) so the
+  // two can be compared/joined.
   if (opts.type === 'chat') {
     return {
       [GEN_AI_ATTR_REQUEST_MODEL]: opts.model,
       [GEN_AI_ATTR_OPERATION_NAME]: 'chat',
       'http.response.status_code': opts.status,
+      'provider': opts.provider,
     }
   }
 
@@ -64,7 +77,16 @@ function getLlmMetricAttributes(opts: { model: string, type: string, status: num
     [GEN_AI_ATTR_REQUEST_MODEL]: opts.model,
     [AIRI_ATTR_GEN_AI_OPERATION_KIND]: opts.type,
     'http.response.status_code': opts.status,
+    'provider': opts.provider,
   }
+}
+
+// Fresh per-request context handed to `llmRouter.route` / `routeTts` so the
+// router can report back which upstream it used (for the `provider` metric
+// label). Must be created per request — never shared — because the route
+// closures live at factory scope across concurrent requests.
+function newRouteContext(): LlmRouteContext {
+  return { provider: 'unknown', triedUpstreams: 0, triedKeys: 0, lastStatus: null }
 }
 
 export function createV1Routes(
@@ -78,12 +100,13 @@ export function createV1Routes(
   revenue?: RevenueMetrics | null,
   rateLimitMetrics?: RateLimitMetrics | null,
   posthog?: PostHog | null,
+  llmTracing: LlmTracingDeps = { startChatGeneration, startTtsGeneration },
 ) {
   const logger = useLogger('v1-completions').useGlobalConfig()
   // TODO: Extract this compat route into smaller facades/modules.
   // It currently mixes auth, rate limiting, proxying, billing, telemetry, and event publishing in one transport layer entrypoint.
 
-  function recordMetrics(opts: { model: string, status: number, type: string, durationMs: number, fluxConsumed: number, promptTokens?: number, completionTokens?: number }) {
+  function recordMetrics(opts: { model: string, status: number, type: string, provider: string, durationMs: number, fluxConsumed: number, promptTokens?: number, completionTokens?: number }) {
     if (!genAi)
       return
     const attrs = getLlmMetricAttributes(opts)
@@ -174,25 +197,50 @@ export function createV1Routes(
     // fluxConsumed: 0 while real cost was incurred — a silent revenue leak.
     // Source: codex review 2026-05-15 HIGH #1.
     const clientAbort = c.req.raw.signal
+    const routeCtx = newRouteContext()
     let response: Response
     try {
       response = await context.with(trace.setSpan(context.active(), span), () =>
-        llmRouter.route({ modelName: requestModel, body, headers: {}, abortSignal: clientAbort }))
+        llmRouter.route({ modelName: requestModel, body, headers: {}, abortSignal: clientAbort }, routeCtx))
     }
     catch (err) {
       span.setStatus({ code: SpanStatusCode.ERROR, message: 'Router exhausted or unknown model' })
       span.end()
-      recordMetrics({ model: requestModel, status: 502, type: 'chat', durationMs: Date.now() - startedAt, fluxConsumed: 0 })
+      llmTracing.startChatGeneration({
+        input: body.messages,
+        model: routeCtx.upstreamModel ?? requestModel,
+        requestId,
+        stream,
+        userId: user.id,
+        sessionId: c.req.header('x-airi-session-id'),
+      }).fail('Router exhausted or unknown model')
+      recordMetrics({ model: requestModel, status: 502, type: 'chat', provider: routeCtx.provider, durationMs: Date.now() - startedAt, fluxConsumed: 0 })
       throw err
     }
 
     const durationMs = Date.now() - startedAt
     span.setAttribute('http.response.status_code', response.status)
+    const langfuseModel = routeCtx.upstreamModel ?? requestModel
+
+    // Langfuse LLM-native generation: per-request prompt/completion record
+    // (input/output/model/usage) powering prompt trace, eval, and per-user/
+    // session cost. Use the router-resolved upstream model, not the client
+    // alias (`auto` / `chat-auto`), so Langfuse model-cost grouping matches the
+    // provider model that actually generated the tokens.
+    const generationTrace = llmTracing.startChatGeneration({
+      input: body.messages,
+      model: langfuseModel,
+      requestId,
+      stream,
+      userId: user.id,
+      sessionId: c.req.header('x-airi-session-id'),
+    })
 
     if (!response.ok) {
       span.setStatus({ code: SpanStatusCode.ERROR, message: `Gateway ${response.status}` })
       span.end()
-      recordMetrics({ model: requestModel, status: response.status, type: 'chat', durationMs, fluxConsumed: 0 })
+      generationTrace.fail(`Gateway ${response.status}`)
+      recordMetrics({ model: requestModel, status: response.status, type: 'chat', provider: routeCtx.provider, durationMs, fluxConsumed: 0 })
       // Emit server-side so funnels see real HTTP status — the client only
       // ever observes "stream closed" and cannot tell 401 / 429 / 5xx apart.
       void captureSafe(posthog ?? null, {
@@ -249,11 +297,15 @@ export function createV1Routes(
               genAi?.firstTokenDuration.record((firstChunkAt - startedAt) / 1000, {
                 [GEN_AI_ATTR_REQUEST_MODEL]: requestModel,
                 [GEN_AI_ATTR_OPERATION_NAME]: 'chat',
+                provider: routeCtx.provider,
               })
             }
             await writer.write(value)
             const text = decoder.decode(value, { stream: true })
             tailBuffer = (tailBuffer + text).slice(-2048)
+            // Accumulate the assistant completion for the Langfuse trace output
+            // (no-op when tracing is off). Module owns SSE parsing + the cap.
+            generationTrace.appendStreamChunk(text)
           }
         }
         catch (err) {
@@ -280,7 +332,8 @@ export function createV1Routes(
         finally {
           if (streamInterrupted) {
             span.end()
-            recordMetrics({ model: requestModel, status: response.status, type: 'chat', durationMs, fluxConsumed: 0 })
+            generationTrace.fail('Gateway stream interrupted')
+            recordMetrics({ model: requestModel, status: response.status, type: 'chat', provider: routeCtx.provider, durationMs, fluxConsumed: 0 })
           }
           else if (streamCompleted) {
             try {
@@ -290,7 +343,6 @@ export function createV1Routes(
               logger.withError(err).warn('Failed to close stream writer')
             }
 
-            // Extract usage from final SSE data lines
             let usage: UsageInfo = {}
             try {
               const lines = tailBuffer.split('\n').filter(l => l.startsWith('data: ') && !l.includes('[DONE]'))
@@ -310,7 +362,14 @@ export function createV1Routes(
               [AIRI_ATTR_BILLING_FLUX_CONSUMED]: fluxConsumed,
             })
             span.end()
-            recordMetrics({ model: requestModel, status: response.status, type: 'chat', durationMs, fluxConsumed, ...usage })
+            // Streaming output comes from appendStreamChunk above, so succeed
+            // omits it and the module uses the assembled assistant text.
+            generationTrace.succeed({
+              promptTokens: usage.promptTokens,
+              completionTokens: usage.completionTokens,
+              fluxConsumed,
+            })
+            recordMetrics({ model: requestModel, status: response.status, type: 'chat', provider: routeCtx.provider, durationMs, fluxConsumed, ...usage })
 
             // Debit flux via DB transaction (source of truth)
             // NOTICE: streaming response is already sent, so we cannot reject on failure.
@@ -407,8 +466,21 @@ export function createV1Routes(
       })
     }
 
-    // Non-streaming: parse response, bill, then return
-    const responseBody = await response.json()
+    // Non-streaming: parse response, bill, then return.
+    // Parse failure (malformed upstream JSON) must close both span and the
+    // Langfuse generation before bubbling up — otherwise the trace leaks.
+    // Mirrors the error-branch shape used above (router throw / !response.ok).
+    let responseBody
+    try {
+      responseBody = await response.json()
+    }
+    catch (err) {
+      span.setStatus({ code: SpanStatusCode.ERROR, message: 'Failed to parse upstream response body' })
+      span.end()
+      generationTrace.fail('Failed to parse upstream response body')
+      recordMetrics({ model: requestModel, status: response.status, type: 'chat', provider: routeCtx.provider, durationMs, fluxConsumed: 0 })
+      throw err
+    }
     const usage = extractUsageFromBody(responseBody)
     const fluxConsumed = calculateFluxFromUsage(usage, fluxPer1kTokens, fallbackRate)
 
@@ -418,7 +490,13 @@ export function createV1Routes(
       [AIRI_ATTR_BILLING_FLUX_CONSUMED]: fluxConsumed,
     })
     span.end()
-    recordMetrics({ model: requestModel, status: response.status, type: 'chat', durationMs, fluxConsumed, ...usage })
+    generationTrace.succeed({
+      output: responseBody,
+      promptTokens: usage.promptTokens,
+      completionTokens: usage.completionTokens,
+      fluxConsumed,
+    })
+    recordMetrics({ model: requestModel, status: response.status, type: 'chat', provider: routeCtx.provider, durationMs, fluxConsumed, ...usage })
 
     // Debit flux via DB transaction (source of truth).
     // The upstream call has already happened (cost incurred), so partial
@@ -527,6 +605,13 @@ export function createV1Routes(
       speed: typeof body.speed === 'number' ? body.speed : undefined,
       responseFormat: typeof body.response_format === 'string' ? body.response_format : undefined,
     }
+    const generationTrace = llmTracing.startTtsGeneration({
+      input: ttsInput,
+      model: requestModel,
+      requestId,
+      userId: user.id,
+      sessionId: c.req.header('x-airi-session-id'),
+    })
 
     const span = tracer.startSpan('llm.gateway.tts', {
       attributes: {
@@ -537,15 +622,17 @@ export function createV1Routes(
 
     const startedAt = Date.now()
 
+    const routeCtx = newRouteContext()
     let response: Response
     try {
       response = await context.with(trace.setSpan(context.active(), span), () =>
-        llmRouter.routeTts({ modelName: requestModel, input: ttsInput, abortSignal: c.req.raw.signal }))
+        llmRouter.routeTts({ modelName: requestModel, input: ttsInput, abortSignal: c.req.raw.signal }, routeCtx))
     }
     catch (err) {
       span.setStatus({ code: SpanStatusCode.ERROR, message: 'TTS router exhausted or unknown model' })
       span.end()
-      recordMetrics({ model: requestModel, status: 502, type: 'tts', durationMs: Date.now() - startedAt, fluxConsumed: 0 })
+      generationTrace.fail('TTS router exhausted or unknown model')
+      recordMetrics({ model: requestModel, status: 502, type: 'tts', provider: routeCtx.provider, durationMs: Date.now() - startedAt, fluxConsumed: 0 })
       throw err
     }
 
@@ -555,7 +642,8 @@ export function createV1Routes(
     if (!response.ok) {
       span.setStatus({ code: SpanStatusCode.ERROR, message: `Gateway ${response.status}` })
       span.end()
-      recordMetrics({ model: requestModel, status: response.status, type: 'tts', durationMs, fluxConsumed: 0 })
+      generationTrace.fail(`Gateway ${response.status}`)
+      recordMetrics({ model: requestModel, status: response.status, type: 'tts', provider: routeCtx.provider, durationMs, fluxConsumed: 0 })
       logger.withFields({ requestId, userId: user.id, model: requestModel, status: response.status, durationMs })
         .warn('tts speech delivered with upstream error status')
       return new Response(response.body, {
@@ -584,11 +672,20 @@ export function createV1Routes(
       })
       fluxConsumed = result.fluxDebited
       span.setAttribute(AIRI_ATTR_BILLING_FLUX_CONSUMED, fluxConsumed)
+      generationTrace.succeed({
+        inputChars: inputText.length,
+        fluxConsumed,
+        output: { contentType: response.headers.get('content-type') },
+      })
+    }
+    catch (err) {
+      generationTrace.fail('TTS billing failed')
+      throw err
     }
     finally {
       span.end()
     }
-    recordMetrics({ model: requestModel, status: response.status, type: 'tts', durationMs, fluxConsumed })
+    recordMetrics({ model: requestModel, status: response.status, type: 'tts', provider: routeCtx.provider, durationMs, fluxConsumed })
 
     recordRequestLog({
       userId: user.id,
@@ -702,14 +799,9 @@ export function createV1Routes(
   }
 
   async function handleListTTSModels(_c: Context<HonoEnv>) {
-    // Surface the concrete TTS models the operator has configured plus the
-    // `auto` alias. Clients need real model ids to pass `?model=<id>` to
-    // `/audio/voices`, otherwise the voice catalog endpoint can never resolve
-    // anything beyond the DEFAULT_TTS_MODEL catalog — which is the bug that
-    // hid the Azure voices from the UI.
-    //
-    // `auto` is kept on top as an explicit "use the operator default" knob
-    // for clients that don't care which concrete model handles them.
+    // Surface the concrete TTS models the operator has configured. The UI
+    // should select an explicit model id so voice catalog requests stay
+    // model-scoped instead of hiding behind DEFAULT_TTS_MODEL.
     const config = await configKV.getOrThrow('LLM_ROUTER_CONFIG')
     // `LLM_ROUTER_CONFIG` is `optional()` at the schema, so its inferred type
     // tolerates `undefined`. `getOrThrow` already throws on missing entries,
@@ -717,29 +809,32 @@ export function createV1Routes(
     // a TS narrowing aid.
     const modelIds = Object.keys(config?.tts?.models ?? {}).sort()
     return Response.json({
-      models: [
-        { id: 'auto', name: 'Auto' },
-        ...modelIds.map(id => ({ id, name: id })),
-      ],
+      models: modelIds.map(id => ({ id, name: id })),
     })
   }
 
   async function handleListStreamingTTSModels(_c: Context<HonoEnv>) {
     const unspeech = await configKV.getOptional('UNSPEECH_UPSTREAM')
     const models = unspeech?.streaming?.models ?? []
+    // `available` is the operator-controlled visibility switch the client gates
+    // the streaming provider on. It tracks whether `UNSPEECH_UPSTREAM.streaming`
+    // is configured at all — not whether `models[]` happens to be empty — so an
+    // operator who has wired the upstream but not yet curated models still
+    // surfaces the provider rather than silently hiding it.
     return Response.json({
+      available: !!unspeech?.streaming?.baseURL,
       models: models.map(m => ({
         id: m.id,
         name: m.name ?? m.id,
         description: m.description,
       })),
+      default: unspeech?.streaming?.defaultModel ?? null,
     })
   }
 
   const chatGuard = configGuard(configKV, ['FLUX_PER_REQUEST'], 'Service is not available yet')
   const ttsGuard = configGuard(configKV, ['FLUX_PER_1K_CHARS_TTS'], 'TTS service is not available yet')
 
-  // 60 requests per minute per user for LLM completions
   const completionsRateLimit = rateLimiter({ max: 60, windowSec: 60, metrics: rateLimitMetrics, routeLabel: 'openai.completions' })
 
   // OpenAI-compatible surface (mounted at /api/v1/openai). Only routes that
